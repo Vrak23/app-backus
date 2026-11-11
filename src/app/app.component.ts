@@ -1,8 +1,9 @@
-import { Component, OnInit, inject } from '@angular/core';
+import { Component, OnInit, inject, ChangeDetectorRef } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { SwUpdate } from '@angular/service-worker';
-import { CatalogoService, Producto, PrecioUpdate, Pedido } from './services/catalogo.service';
+import { CatalogoService, Producto } from './services/catalogo.service';
+import { StorageService, Pedido, LineaPedido, EstadoPedido } from './services/storage.service';
 
 @Component({
   selector: 'app-root',
@@ -13,43 +14,64 @@ import { CatalogoService, Producto, PrecioUpdate, Pedido } from './services/cata
 })
 export class AppComponent implements OnInit {
   private catalogoService = inject(CatalogoService);
+  private storageService = inject(StorageService);
   private swUpdate = inject(SwUpdate);
+  private cdr = inject(ChangeDetectorRef);
 
+  // Catálogo y filtros (BV-01, BV-02)
   productos: Producto[] = [];
   productosFiltrados: Producto[] = [];
-  cargando: boolean = true;
-  errorMensaje: string = '';
-  
-  isOnline: boolean = true;
-  categoriaSeleccionada: string = 'TODAS';
+  cargando: boolean = false;
   busquedaTexto: string = '';
-  
-  // Carrito de pedidos
-  carrito: { producto: Producto; cantidad: number }[] = [];
-  nombreCliente: string = '';
-  pedidos: Pedido[] = [];
-  mostrarCarrito: boolean = false;
-  mostrarModalTecnico: boolean = false;
+  categoriaSeleccionada: string = 'TODAS';
+  categoriasDisponibles: string[] = ['TODAS', 'Cerveza', 'Gaseosa', 'Agua'];
 
-  // Estado del Service Worker
+  // Selección de cantidades en catálogo (BV-03)
+  cantidadesSeleccionadas: { [productoId: number]: number } = {};
+
+  // Carrito de compras / Resumen de pedido (BV-03, BV-04)
+  lineasCarrito: LineaPedido[] = [];
+  nombreCliente: string = '';
+  errorFormulario: string = '';
+  mostrarCarrito: boolean = false;
+
+  // Conectividad (BV-06)
+  isOnline: boolean = typeof navigator !== 'undefined' ? navigator.onLine : true;
   swActivo: boolean = false;
   swMensaje: string = '';
-  ultimaActualizacionPrecios: string = '2026-10-01 09:00';
+
+  // Historial de pedidos persistidos en IndexedDB (BV-05, BV-06)
+  pedidosHistorial: Pedido[] = [];
+  pedidoSeleccionadoDetalle: Pedido | null = null;
+  mostrarModalDetalle: boolean = false;
+
+  // Notificaciones al usuario (BV-07)
+  notificacion: { texto: string; tipo: 'success' | 'warning' | 'error' | 'info' } | null = null;
+  mostrarModalTecnico: boolean = false;
 
   ngOnInit(): void {
     this.verificarConectividad();
-    this.cargarDatos();
+    this.cargarCatalogo();
     this.verificarServiceWorker();
-    this.cargarPedidosGuardados();
+    this.cargarHistorialIndexedDB();
   }
 
+  // --- CONECTIVIDAD Y SERVICE WORKER ---
   verificarConectividad(): void {
-    this.catalogoService.isOnline().subscribe(online => {
-      const eraOffline = !this.isOnline && online;
+    this.catalogoService.isOnline().subscribe((online) => {
       this.isOnline = online;
-      if (eraOffline) {
-        this.sincronizarPedidosPendientes();
+      if (online) {
+        this.mostrarAviso(
+          'Conexión recuperada. Listo para intentar sincronizar. (Sin API activa, los pedidos se mantienen en estado PENDIENTE).',
+          'info'
+        );
+      } else {
+        this.mostrarAviso(
+          'Modo sin conexión. Todos los pedidos se persistirán en IndexedDB de forma local.',
+          'warning'
+        );
       }
+      this.cdr.detectChanges();
     });
   }
 
@@ -61,67 +83,56 @@ export class AppComponent implements OnInit {
   verificarServiceWorker(): void {
     if (this.swUpdate.isEnabled) {
       this.swActivo = true;
-      this.swMensaje = 'Angular Service Worker (ngsw-worker.js) registrado y activo.';
-      
-      this.swUpdate.versionUpdates.subscribe(evt => {
+      this.swMensaje = 'Angular Service Worker activo y cacheando recursos (ngsw-worker.js)';
+      this.swUpdate.versionUpdates.subscribe((evt) => {
         if (evt.type === 'VERSION_READY') {
-          if (confirm('Nueva versión disponible de Backus Ventas. ¿Desea actualizar?')) {
+          if (confirm('Nueva versión de Backus Ventas disponible. ¿Desea actualizar?')) {
             window.location.reload();
           }
         }
       });
     } else {
       this.swActivo = false;
-      this.swMensaje = 'Service Worker inactivo (modo desarrollo o navegador no compatible).';
+      this.swMensaje = 'Service Worker inactivo (modo desarrollo o navegador sin SSL/localhost).';
     }
   }
 
-  cargarDatos(): void {
+  // --- CATÁLOGO, BÚSQUEDA Y FILTROS (BV-01, BV-02) ---
+  cargarCatalogo(): void {
     this.cargando = true;
     this.catalogoService.obtenerCatalogo().subscribe({
       next: (data) => {
-        this.productos = data;
+        this.productos = data || [];
+        this.productos.forEach((p) => {
+          if (!this.cantidadesSeleccionadas[p.id]) {
+            this.cantidadesSeleccionadas[p.id] = 1;
+          }
+        });
         this.filtrarProductos();
         this.cargando = false;
-        
-        // Intentar actualizar precios en segundo plano (Freshness)
-        this.actualizarPreciosFrescos();
+        this.cdr.detectChanges();
       },
       error: (err) => {
         console.error('Error al cargar catálogo:', err);
-        this.errorMensaje = 'No se pudo cargar el catálogo. Verifique si está en caché o la red.';
         this.cargando = false;
-      }
-    });
-  }
-
-  actualizarPreciosFrescos(): void {
-    this.catalogoService.obtenerPrecios().subscribe({
-      next: (precios) => {
-        precios.forEach(p => {
-          const item = this.productos.find(prod => prod.id === p.productoId);
-          if (item) {
-            item.precio = p.precio;
-            item.stock = p.stock;
-            item.actualizado = p.actualizado;
-          }
-        });
-        this.ultimaActualizacionPrecios = new Date().toLocaleTimeString();
-        this.filtrarProductos();
-      },
-      error: (err) => {
-        console.warn('No se pudo obtener precios frescos de la red; usando datos en caché:', err);
+        this.cdr.detectChanges();
       }
     });
   }
 
   filtrarProductos(): void {
-    this.productosFiltrados = this.productos.filter(prod => {
-      const coincideCat = this.categoriaSeleccionada === 'TODAS' || 
-                           prod.categoria.toLowerCase() === this.categoriaSeleccionada.toLowerCase();
-      const coincideBusqueda = prod.nombre.toLowerCase().includes(this.busquedaTexto.toLowerCase()) ||
-                               prod.categoria.toLowerCase().includes(this.busquedaTexto.toLowerCase());
-      return coincideCat && coincideBusqueda;
+    const busq = this.busquedaTexto.trim().toLowerCase();
+    this.productosFiltrados = this.productos.filter((prod) => {
+      const matchCategoria =
+        this.categoriaSeleccionada === 'TODAS' ||
+        prod.categoria.toLowerCase() === this.categoriaSeleccionada.toLowerCase();
+
+      const matchNombre =
+        !busq ||
+        prod.nombre.toLowerCase().includes(busq) ||
+        prod.categoria.toLowerCase().includes(busq);
+
+      return matchCategoria && matchNombre;
     });
   }
 
@@ -130,103 +141,188 @@ export class AppComponent implements OnInit {
     this.filtrarProductos();
   }
 
-  // Métodos de Carrito y Pedidos Offline
+  limpiarFiltros(): void {
+    this.busquedaTexto = '';
+    this.categoriaSeleccionada = 'TODAS';
+    this.filtrarProductos();
+  }
+
+  // --- VALIDACIÓN DE CANTIDADES Y CARRITO (BV-03, BV-04) ---
+  modificarCantidadInput(productoId: number, delta: number): void {
+    const actual = this.cantidadesSeleccionadas[productoId] || 1;
+    const nueva = actual + delta;
+    if (nueva >= 1) {
+      this.cantidadesSeleccionadas[productoId] = Math.floor(nueva);
+    }
+  }
+
   agregarAlCarrito(producto: Producto): void {
-    const itemExistente = this.carrito.find(item => item.producto.id === producto.id);
+    const rawCantidad = this.cantidadesSeleccionadas[producto.id];
+    
+    // Regla BV-03: Solo enteros positivos mayores a cero
+    if (!Number.isInteger(rawCantidad) || rawCantidad <= 0) {
+      this.mostrarAviso(
+        `Cantidad inválida para ${producto.nombre}. Debe ser un número entero mayor que cero.`,
+        'error'
+      );
+      return;
+    }
+
+    const cantidad = Math.floor(rawCantidad);
+    const subtotal = Math.round(producto.precio * cantidad * 100) / 100;
+
+    const itemExistente = this.lineasCarrito.find((l) => l.productoId === producto.id);
     if (itemExistente) {
-      if (itemExistente.cantidad < producto.stock) {
-        itemExistente.cantidad++;
-      } else {
-        alert('Límite de stock alcanzado para ' + producto.nombre);
-      }
+      itemExistente.cantidad += cantidad;
+      itemExistente.subtotal = Math.round(itemExistente.precioUnitario * itemExistente.cantidad * 100) / 100;
     } else {
-      this.carrito.push({ producto, cantidad: 1 });
+      this.lineasCarrito.push({
+        productoId: producto.id,
+        producto: producto.nombre,
+        precioUnitario: producto.precio,
+        cantidad: cantidad,
+        subtotal: subtotal
+      });
+    }
+
+    this.mostrarAviso(`Agregado al pedido: ${cantidad}x ${producto.nombre}`, 'success');
+  }
+
+  removerLinea(productoId: number): void {
+    this.lineasCarrito = this.lineasCarrito.filter((l) => l.productoId !== productoId);
+  }
+
+  cambiarCantidadEnCarrito(linea: LineaPedido, delta: number): void {
+    const nueva = linea.cantidad + delta;
+    if (nueva >= 1) {
+      linea.cantidad = nueva;
+      linea.subtotal = Math.round(linea.precioUnitario * linea.cantidad * 100) / 100;
+    } else {
+      this.removerLinea(linea.productoId);
     }
   }
 
-  removerDelCarrito(id: number): void {
-    this.carrito = this.carrito.filter(item => item.producto.id !== id);
+  calcularTotalPedido(): number {
+    return this.lineasCarrito.reduce((acc, l) => acc + l.subtotal, 0);
   }
 
-  cambiarCantidad(id: number, delta: number): void {
-    const item = this.carrito.find(i => i.producto.id === id);
-    if (item) {
-      const nuevaCantidad = item.cantidad + delta;
-      if (nuevaCantidad > 0 && nuevaCantidad <= item.producto.stock) {
-        item.cantidad = nuevaCantidad;
-      } else if (nuevaCantidad === 0) {
-        this.removerDelCarrito(id);
+  totalUnidadesCarrito(): number {
+    return this.lineasCarrito.reduce((acc, l) => acc + l.cantidad, 0);
+  }
+
+  // --- REGISTRO Y PERSISTENCIA EN INDEXEDDB (BV-05, BV-06, BV-07) ---
+  async registrarPedido(): Promise<void> {
+    this.errorFormulario = '';
+
+    // Impedir registrar pedidos vacíos (BV-04, BV-05)
+    if (this.lineasCarrito.length === 0) {
+      this.errorFormulario = 'No se puede registrar un pedido vacío.';
+      this.mostrarAviso(this.errorFormulario, 'error');
+      return;
+    }
+
+    // Validar que no existan cantidades inválidas en las líneas
+    for (const linea of this.lineasCarrito) {
+      if (!Number.isInteger(linea.cantidad) || linea.cantidad <= 0) {
+        this.errorFormulario = `Cantidad no válida en ${linea.producto}.`;
+        this.mostrarAviso(this.errorFormulario, 'error');
+        return;
       }
     }
-  }
 
-  calcularTotal(): number {
-    return this.carrito.reduce((sum, item) => sum + (item.producto.precio * item.cantidad), 0);
-  }
+    const cliente = this.nombreCliente.trim() || 'Cliente Mostrador / Bodega';
+    const total = this.calcularTotalPedido();
 
-  totalItemsCarrito(): number {
-    return this.carrito.reduce((sum, item) => sum + item.cantidad, 0);
-  }
-
-  registrarPedido(): void {
-    if (!this.nombreCliente.trim()) {
-      alert('Por favor ingrese el nombre de la bodega o cliente.');
-      return;
-    }
-
-    if (this.carrito.length === 0) {
-      alert('El carrito de compras está vacío.');
-      return;
-    }
-
-    const nuevoPedido: Pedido = {
-      id: 'PED-' + Math.floor(100000 + Math.random() * 900000),
-      fecha: new Date().toLocaleString(),
-      cliente: this.nombreCliente.trim(),
-      items: [...this.carrito],
-      total: this.calcularTotal(),
-      estado: this.isOnline ? 'SINCRONIZADO' : 'PENDIENTE'
+    const nuevoPedido: Omit<Pedido, 'id'> = {
+      fecha: new Date().toISOString(),
+      cliente: cliente,
+      lineas: JSON.parse(JSON.stringify(this.lineasCarrito)),
+      total: total,
+      estado: 'PENDIENTE', // Regla BV-06: sin API real conserva PENDIENTE
+      origen: this.isOnline ? 'ONLINE' : 'OFFLINE'
     };
 
-    this.pedidos.unshift(nuevoPedido);
-    this.guardarPedidos();
-    
-    const msg = this.isOnline 
-      ? `¡Pedido ${nuevoPedido.id} enviado exitosamente al servidor central de Backus!`
-      : `¡Pedido ${nuevoPedido.id} guardado localmente (OFFLINE)! Se sincronizará automáticamente al volver a tener señal.`;
-    
-    alert(msg);
-
-    this.carrito = [];
-    this.nombreCliente = '';
-    this.mostrarCarrito = false;
-  }
-
-  sincronizarPedidosPendientes(): void {
-    const pendientes = this.pedidos.filter(p => p.estado === 'PENDIENTE');
-    if (pendientes.length > 0) {
-      pendientes.forEach(p => p.estado = 'SINCRONIZADO');
-      this.guardarPedidos();
-      alert(`[Sincronización PWA] Se sincronizaron ${pendientes.length} pedido(s) pendientes al recuperar la conexión.`);
-    }
-  }
-
-  guardarPedidos(): void {
     try {
-      localStorage.setItem('backus_pedidos', JSON.stringify(this.pedidos));
-    } catch (e) {
-      console.error('Error guardando en almacenamiento local:', e);
-    }
-  }
+      // Guardar primero en IndexedDB antes de confirmar (BV-05)
+      const idGenerado = await this.storageService.guardarPedido(nuevoPedido);
+      console.log(`Pedido #${idGenerado} persistido en IndexedDB exitosamente.`);
 
-  cargarPedidosGuardados(): void {
-    try {
-      const data = localStorage.getItem('backus_pedidos');
-      if (data) {
-        this.pedidos = JSON.parse(data);
+      // Recargar historial desde IndexedDB
+      await this.cargarHistorialIndexedDB();
+
+      // Limpiar formulario y carrito
+      this.lineasCarrito = [];
+      this.nombreCliente = '';
+      this.mostrarCarrito = false;
+
+      // Mensaje coherente según reglas (BV-06, BV-07)
+      if (this.isOnline) {
+        this.mostrarAviso(
+          `Pedido #${idGenerado} guardado en el dispositivo (IndexedDB). [Aviso: Al no disponer de API empresarial remota, el pedido se mantiene en estado PENDIENTE].`,
+          'success'
+        );
+      } else {
+        this.mostrarAviso(
+          `Pedido #${idGenerado} guardado localmente (OFFLINE). Persistido de forma segura en IndexedDB.`,
+          'success'
+        );
       }
-    } catch (e) {
-      console.error('Error leyendo pedidos:', e);
+    } catch (error) {
+      console.error('Error al persistir en IndexedDB:', error);
+      // Regla BV-07: Se informa el error y no se confirma éxito
+      this.mostrarAviso('Error crítico en IndexedDB: No se pudo persistir el pedido. Intente nuevamente.', 'error');
+    }
+  }
+
+  async cargarHistorialIndexedDB(): Promise<void> {
+    try {
+      this.pedidosHistorial = await this.storageService.obtenerPedidos();
+      this.cdr.detectChanges();
+    } catch (err) {
+      console.error('Error cargando historial de pedidos:', err);
+      this.pedidosHistorial = [];
+    }
+  }
+
+  // --- CONSULTA DE DETALLE (BV-05) ---
+  verDetallePedido(pedido: Pedido): void {
+    this.pedidoSeleccionadoDetalle = pedido;
+    this.mostrarModalDetalle = true;
+  }
+
+  cerrarDetalle(): void {
+    this.mostrarModalDetalle = false;
+    this.pedidoSeleccionadoDetalle = null;
+  }
+
+  // --- AUXILIARES Y NOTIFICACIONES ---
+  mostrarAviso(texto: string, tipo: 'success' | 'warning' | 'error' | 'info' = 'info'): void {
+    this.notificacion = { texto, tipo };
+    setTimeout(() => {
+      if (this.notificacion?.texto === texto) {
+        this.notificacion = null;
+        this.cdr.detectChanges();
+      }
+    }, 6000);
+  }
+
+  cerrarAviso(): void {
+    this.notificacion = null;
+  }
+
+  formatearFecha(isoString: string): string {
+    if (!isoString) return '-';
+    try {
+      const d = new Date(isoString);
+      return d.toLocaleString('es-PE', {
+        day: '2-digit',
+        month: '2-digit',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch {
+      return isoString;
     }
   }
 }
